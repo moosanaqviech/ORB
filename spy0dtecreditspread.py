@@ -1,0 +1,496 @@
+"""
+spy0dtecreditspread.py - 0DTE SPY credit spreads on IBKR ("variant I" rules).
+
+Same building blocks as orbcreditspread.py / spyironbutterfly.py (ib_insync,
+BAG combo with ComboLegs), with the rules from the backtest:
+
+  Day filters (checked at the first entry): skip FOMC days, jobs-report
+  Fridays, days when prior VIX close > prior VIX3M close, and days when SPY
+  opened with a gap bigger than 1x the expected daily move (VIX/sqrt(252)).
+
+  Every 30 min from 10:00 to 14:30 ET, for the put side and the call side:
+    - short strike = the 0DTE option closest to 10 delta (IBKR greeks;
+      falls back to Black-Scholes on prior VIX if greeks are missing)
+    - long strike  = $2 further out of the money
+    - only open if the mid credit is >= $0.10; sell with a limit at the mid,
+      stepping down 1 cent at a time (never below $0.10), cancel if no fill
+    - as soon as it fills, place a DAY limit order to buy it back at 50% of
+      the credit received
+  No stop-loss, no rolling. At 15:55 cancel the take-profit orders and buy
+  back everything still open (SPY is physically settled - don't risk
+  assignment). Any leftover SPY 0DTE option legs are closed one by one.
+
+Run:  python spy0dtecreditspread.py            (start any time before 10:00 ET)
+      python spy0dtecreditspread.py --dry-run  (does everything except orders)
+
+Trades are appended to logs/0dte_trades.csv.
+Settings below. Defaults are the PAPER port; the script refuses to run on a
+live port unless ALLOW_LIVE = True.
+"""
+
+import argparse
+import csv
+import math
+import os
+import sys
+from datetime import date, datetime, timedelta, timezone
+
+import nest_asyncio
+from ib_insync import IB, ComboLeg, Contract, Index, LimitOrder, Option, Stock
+
+nest_asyncio.apply()
+
+# ================================ SETTINGS ===================================
+HOST = '127.0.0.1'
+PORT = 7497                  # TWS paper 7497 / live 7496; Gateway paper 4002 / live 4001
+CLIENT_ID = 21
+ALLOW_LIVE = False           # must be True to run on 7496 / 4001
+MARKET_DATA_TYPE = 3         # 1 live, 3 delayed (delayed: fills will differ from quotes)
+
+SYMBOL = 'SPY'
+QTY = 1                      # contracts per spread
+SIDES = ('P', 'C')           # put spread and call spread
+ENTRY_START, ENTRY_END, ENTRY_EVERY = '10:00', '14:30', 15
+TARGET_DELTA = 0.10
+WIDTH = 2.0                  # $ between short and long strike
+MIN_CREDIT = 0.10            # skip a side if mid credit is below this
+PROFIT_TAKE = 0.50           # buy back at (1 - 0.50) x credit
+FLATTEN = '15:55'
+CLOSE_ALL_AT_FLATTEN = True  # True: close even 1-cent spreads (assignment risk on SPY)
+MAX_OPEN_SPREADS = 12        # safety cap
+CLOSE_LEFTOVER_LEGS = True   # at 15:55 also close ANY SPY 0DTE option position in the account
+
+ENTRY_REPRICE_SEC = 10       # wait between 1-cent price steps when opening
+ENTRY_MAX_STEPS = 3          # mid, mid-0.01, mid-0.02, mid-0.03 then cancel
+EXIT_REPRICE_SEC = 5         # same when closing at 15:55, stepping UP
+
+# Day filters
+SKIP_EVENTS = False
+SKIP_VIX_BACKWARDATION = True
+SKIP_BIG_GAP = True
+GAP_MAX_SIGMA = 1.0
+FALLBACK_IV_MULT = 0.8       # only used if IBKR greeks are missing
+PUT_SKEW, CALL_SKEW = 1.15, 0.90
+
+# FOMC decision days (2nd day of each meeting). Add next year's from federalreserve.gov.
+FOMC_DAYS = {'2026-01-28', '2026-03-18', '2026-04-29', '2026-06-17',
+             '2026-07-29', '2026-09-16', '2026-10-28', '2026-12-09'}
+# Jobs report is assumed on the FIRST Friday of the month. When BLS moves it
+# (e.g. to the 2nd Friday), add that date here. Also any other day to sit out.
+EXTRA_SKIP_DAYS = set()
+# Early closes (13:00 ET): entries stop an hour before, flatten 5 min before.
+HALF_DAYS = {'2026-11-27', '2026-12-24'}
+
+TAG = '0DTE-CS'              # orderRef on every order this script places
+LOG_DIR = 'logs'
+# ============================================================================
+
+LOG_COLS = ['date', 'time', 'event', 'side', 'short', 'long', 'qty', 'price',
+            'credit', 'pnl_per_contract', 'spot', 'short_delta', 'note']
+
+
+# ------------------------------ time (US Eastern) ----------------------------
+def to_eastern(utc_dt):
+    """UTC -> US Eastern without a tz database (works on any Windows Python)."""
+    def nth_sunday(y, mo, n):
+        d = datetime(y, mo, 1)
+        d += timedelta(days=(6 - d.weekday()) % 7)
+        return d + timedelta(weeks=n - 1)
+    naive = utc_dt.replace(tzinfo=None)
+    y = naive.year
+    dst = nth_sunday(y, 3, 2).replace(hour=7) <= naive < nth_sunday(y, 11, 1).replace(hour=6)
+    return naive - timedelta(hours=4 if dst else 5)
+
+
+def now_et():
+    return to_eastern(datetime.now(timezone.utc))
+
+
+def hm(s):
+    return int(s[:2]) * 60 + int(s[3:])
+
+
+def minute_now():
+    t = now_et()
+    return t.hour * 60 + t.minute + t.second / 60
+
+
+# ------------------------------ helpers ---------------------------------------
+def ok(x):
+    return x is not None and not (isinstance(x, float) and math.isnan(x)) and x >= 0
+
+
+def mid(t):
+    return (t.bid + t.ask) / 2 if ok(t.bid) and ok(t.ask) and t.ask > 0 else float('nan')
+
+
+def cents(x):
+    return round(round(x * 100) / 100, 2)
+
+
+def ncdf(x):
+    return 0.5 * (1 + math.erf(x / math.sqrt(2)))
+
+
+def bs_delta(spot, k, iv, mins_left, right):
+    t = max(mins_left, 1) / (252 * 390)
+    v = iv * math.sqrt(t)
+    d1 = (math.log(spot / k) + 0.5 * v * v) / v
+    return ncdf(d1) - (1 if right == 'P' else 0)
+
+
+def log(event, **kw):
+    os.makedirs(LOG_DIR, exist_ok=True)
+    path = os.path.join(LOG_DIR, '0dte_trades.csv')
+    new = not os.path.exists(path)
+    t = now_et()
+    row = {'date': t.date().isoformat(), 'time': t.strftime('%H:%M:%S'), 'event': event, **kw}
+    with open(path, 'a', newline='') as f:
+        w = csv.DictWriter(f, fieldnames=LOG_COLS, extrasaction='ignore')
+        if new:
+            w.writeheader()
+        w.writerow(row)
+    print(f"{row['time']} {event:10} " + ' '.join(f'{k}={v}' for k, v in kw.items()))
+
+
+# ================================ STRATEGY ===================================
+class CreditSpreads:
+    def __init__(self, ib, dry_run=False):
+        self.ib = ib
+        self.dry = dry_run
+        self.today = now_et().date()
+        self.ds = self.today.isoformat()
+        self.expiry = self.today.strftime('%Y%m%d')
+        self.close_m = hm('13:00') if self.ds in HALF_DAYS else hm('16:00')
+        self.flatten_m = min(hm(FLATTEN), self.close_m - 5)
+        self.last_entry_m = min(hm(ENTRY_END), self.close_m - 60)
+        self.spreads = []            # open/closed spreads placed today
+        self.skip = None             # day-filter verdict (None = not checked yet)
+
+        self.und = Stock(SYMBOL, 'SMART', 'USD')
+        ib.qualifyContracts(self.und)
+        chains = ib.reqSecDefOptParams(self.und.symbol, '', 'STK', self.und.conId)
+        chain = next((c for c in chains if c.tradingClass == SYMBOL and c.exchange == 'SMART'),
+                     next((c for c in chains if c.tradingClass == SYMBOL), None))
+        if not chain or self.expiry not in chain.expirations:
+            sys.exit(f'No {SYMBOL} options expire today ({self.expiry}). Nothing to do.')
+        self.strikes = sorted(chain.strikes)
+        self.und_t = ib.reqMktData(self.und, '', False, False)
+        self.vix, self.vix3m = self.prior_close('VIX'), self.prior_close('VIX3M')
+        print(f'{SYMBOL} 0DTE {self.expiry} | prior VIX {self.vix} VIX3M {self.vix3m} | '
+              f'flatten {self.flatten_m // 60}:{self.flatten_m % 60:02d} ET'
+              f'{" | DRY RUN - no orders" if dry_run else ""}')
+
+    # -- data -------------------------------------------------------------------
+    def prior_close(self, name):
+        try:
+            c = Index(name, 'CBOE', 'USD')
+            self.ib.qualifyContracts(c)
+            bars = self.ib.reqHistoricalData(c, '', '10 D', '1 day', 'TRADES', True)
+            prev = [b for b in bars if b.date < self.today]
+            return prev[-1].close if prev else None
+        except Exception as e:
+            print(f'  could not get {name} history: {e}')
+            return None
+
+    def spot(self):
+        p = self.und_t.marketPrice()
+        if ok(p) and p > 0:
+            return p
+        # no live/delayed quote (e.g. no data subscription): use the last 1-min bar
+        try:
+            bars = self.ib.reqHistoricalData(self.und, '', '1800 S', '1 min', 'TRADES', True)
+            if bars:
+                print(f'  no {SYMBOL} quote - using last 1-min bar close {bars[-1].close}')
+                return bars[-1].close
+        except Exception as e:
+            print(f'  1-min bar fallback failed: {e}')
+        return float('nan')
+
+    def option(self, strike, right):
+        return Option(SYMBOL, self.expiry, strike, right, 'SMART',
+                      tradingClass=SYMBOL, currency='USD')
+
+    def quotes(self, contracts, wait=3):
+        ts = [self.ib.reqMktData(c, '', False, False) for c in contracts]
+        self.ib.sleep(wait)
+        return ts
+
+    def release(self, contracts):
+        for c in contracts:
+            self.ib.cancelMktData(c)
+
+    # -- day filters ----------------------------------------------------------
+    def day_skip_reason(self):
+        d = self.today
+        if SKIP_EVENTS and self.ds in FOMC_DAYS:
+            return 'FOMC day'
+        if SKIP_EVENTS and d.weekday() == 4 and d.day <= 7:
+            return 'jobs-report Friday'
+        if self.ds in EXTRA_SKIP_DAYS:
+            return 'in EXTRA_SKIP_DAYS'
+        if SKIP_VIX_BACKWARDATION and self.vix and self.vix3m and self.vix > self.vix3m:
+            return f'VIX {self.vix} > VIX3M {self.vix3m}'
+        if SKIP_BIG_GAP:
+            bars = self.ib.reqHistoricalData(self.und, '', '5 D', '1 day', 'TRADES', True)
+            prev = [b for b in bars if b.date < self.today]
+            tod = [b for b in bars if b.date == self.today]
+            if prev and tod and self.vix:
+                gap = tod[0].open / prev[-1].close - 1
+                limit = GAP_MAX_SIGMA * self.vix / 100 / math.sqrt(252)
+                print(f'  gap at open {gap * 100:+.2f}% (limit +/-{limit * 100:.2f}%)')
+                if abs(gap) > limit:
+                    return f'big gap {gap * 100:+.2f}%'
+            else:
+                print('  gap check: no daily bars - not filtering on gap')
+        if FOMC_DAYS and max(FOMC_DAYS)[:4] < self.ds[:4]:
+            print('  WARNING: FOMC_DAYS has no dates for this year - update the list')
+        return ''
+
+    # -- strike selection ------------------------------------------------------
+    def pick_short(self, right, spot, mins_left):
+        put = right == 'P'
+        band = [k for k in self.strikes
+                if (k < spot if put else k > spot) and abs(k / spot - 1) <= 0.04
+                and abs(k / spot - 1) >= 0.002]
+        band = sorted(band, key=lambda k: abs(k - spot))[:20]
+        cands = self.ib.qualifyContracts(*[self.option(k, right) for k in band])
+        cands = [c for c in cands if c and c.conId]
+        if not cands:
+            return None, None
+        ts = self.quotes(cands, wait=4)
+        fallback_iv = (self.vix or 20) / 100 * FALLBACK_IV_MULT * (PUT_SKEW if put else CALL_SKEW)
+        scored = []
+        for c, t in zip(cands, ts):
+            g = t.modelGreeks
+            if g and g.delta is not None and not math.isnan(g.delta):
+                delta = g.delta
+            else:
+                delta = bs_delta(spot, c.strike, fallback_iv, mins_left, right)
+            scored.append((abs(abs(delta) - TARGET_DELTA), c.strike, delta))
+        self.release(cands)
+        _, k, delta = min(scored)
+        return k, delta
+
+    # -- orders ------------------------------------------------------------------
+    def bag(self, short_c, long_c):
+        # The combo is defined as "long the short strike, short the wing", which is
+        # a debit spread with a POSITIVE price. SELLing it opens our credit spread;
+        # BUYing it back closes it. Positive prices keep the order maths simple.
+        c = Contract(symbol=SYMBOL, secType='BAG', currency='USD', exchange='SMART')
+        c.comboLegs = [ComboLeg(conId=short_c.conId, ratio=1, action='BUY', exchange='SMART'),
+                       ComboLeg(conId=long_c.conId, ratio=1, action='SELL', exchange='SMART')]
+        return c
+
+    def work_order(self, combo, action, qty, start, limit, step, reprice_sec, max_steps):
+        """Place a limit order and step the price 1 cent at a time toward `limit`.
+        Returns (filled qty, avg fill price)."""
+        if self.dry:
+            print(f'  [dry run] would {action} {qty} @ {start:.2f}')
+            return 0, 0.0
+        order = LimitOrder(action, qty, cents(start), tif='DAY', orderRef=TAG)
+        trade = self.ib.placeOrder(combo, order)
+        for i in range(max_steps + 1):
+            self.ib.sleep(reprice_sec)
+            if trade.orderStatus.status == 'Filled':
+                break
+            if trade.isDone():          # rejected / cancelled by IB
+                print(f'  order {trade.orderStatus.status}: '
+                      f'{[e.message for e in trade.log if e.message][-1:]}')
+                break
+            nxt = cents(order.lmtPrice + step)
+            if i < max_steps and ((step < 0 and nxt >= limit) or (step > 0 and nxt <= limit)):
+                order.lmtPrice = nxt
+                self.ib.placeOrder(combo, order)          # modify
+        if not trade.isDone():
+            self.ib.cancelOrder(order)
+            for _ in range(10):
+                self.ib.sleep(1)
+                if trade.isDone():
+                    break
+        return int(trade.orderStatus.filled), trade.orderStatus.avgFillPrice
+
+    # -- entry -------------------------------------------------------------------
+    def entry(self):
+        if self.skip is None:
+            self.skip = self.day_skip_reason()
+            if self.skip:
+                log('skip_day', note=self.skip)
+        if self.skip:
+            return
+        for right in SIDES:
+            if sum(s['open'] for s in self.spreads) >= MAX_OPEN_SPREADS:
+                print('  MAX_OPEN_SPREADS reached')
+                return
+            self.open_spread(right)
+
+    def open_spread(self, right):
+        side = 'put' if right == 'P' else 'call'
+        spot = self.spot()
+        mins_left = self.close_m - minute_now()
+        if not ok(spot):
+            log('no_price', side=side, note=f'no {SYMBOL} price')
+            return
+        ks, delta = self.pick_short(right, spot, mins_left)
+        if ks is None:
+            log('no_strike', side=side, spot=round(spot, 2))
+            return
+        kl = ks - WIDTH if right == 'P' else ks + WIDTH
+        if kl not in self.strikes:
+            log('no_wing', side=side, short=ks, long=kl)
+            return
+        legs = self.ib.qualifyContracts(self.option(ks, right), self.option(kl, right))
+        legs = {c.strike: c for c in legs if c and c.conId}
+        if ks not in legs or kl not in legs:
+            log('no_wing', side=side, short=ks, long=kl)
+            return
+        st, lt = self.quotes([legs[ks], legs[kl]])
+        credit_mid = mid(st) - mid(lt)
+        credit_nat = st.bid - lt.ask if ok(st.bid) and ok(lt.ask) else float('nan')
+        self.release([legs[ks], legs[kl]])
+        info = dict(side=side, short=ks, long=kl, spot=round(spot, 2),
+                    short_delta=round(delta, 3))
+        if not ok(credit_mid) or credit_mid < MIN_CREDIT:
+            log('skip_side', **info, price=round(credit_mid, 3) if ok(credit_mid) else '',
+                note=f'mid credit < {MIN_CREDIT}')
+            return
+        combo = self.bag(legs[ks], legs[kl])
+        start = cents(math.floor(credit_mid * 100 + 1e-9) / 100)
+        filled, px = self.work_order(combo, 'SELL', QTY, start, MIN_CREDIT, -0.01,
+                                     ENTRY_REPRICE_SEC, ENTRY_MAX_STEPS)
+        if not filled:
+            log('dry_run' if self.dry else 'no_fill', **info, price=start,
+                note=f'natural {credit_nat:.2f}' if ok(credit_nat) else '')
+            return
+        tp_px = max(cents(math.floor(px * (1 - PROFIT_TAKE) * 100 + 1e-9) / 100), 0.01)
+        tp = self.ib.placeOrder(combo, LimitOrder('BUY', filled, tp_px, tif='DAY', orderRef=TAG))
+        self.spreads.append({'combo': combo, 'legs': (legs[ks], legs[kl]), 'qty': filled,
+                             'credit': px, 'tp': tp, 'open': True, **info})
+        log('opened', **info, qty=filled, credit=round(px, 2), price=tp_px,
+            note='take-profit order placed')
+
+    # -- manage / exit -----------------------------------------------------------
+    def manage(self):
+        for s in self.spreads:
+            if s['open'] and s['tp'].orderStatus.status == 'Filled':
+                s['open'] = False
+                px = s['tp'].orderStatus.avgFillPrice
+                log('target', side=s['side'], short=s['short'], long=s['long'], qty=s['qty'],
+                    credit=round(s['credit'], 2), price=round(px, 2),
+                    pnl_per_contract=round((s['credit'] - px) * 100, 2))
+
+    def flatten(self):
+        print('Flattening ...')
+        self.manage()
+        for s in self.spreads:
+            if not s['open']:
+                continue
+            tp = s['tp']
+            if not tp.isDone():
+                self.ib.cancelOrder(tp.order)
+                for _ in range(10):
+                    self.ib.sleep(1)
+                    if tp.isDone():
+                        break
+            remaining = s['qty'] - int(tp.orderStatus.filled)
+            if remaining <= 0:
+                self.manage()
+                continue
+            st, lt = self.quotes(list(s['legs']))
+            self.release(list(s['legs']))
+            debit_mid = mid(st) - mid(lt)
+            debit_nat = st.ask - lt.bid if ok(st.ask) and ok(lt.bid) else float('nan')
+            if not CLOSE_ALL_AT_FLATTEN and ok(debit_nat) and debit_nat < 0.05:
+                log('expire', side=s['side'], short=s['short'], long=s['long'],
+                    note='left to expire (< $0.05)')
+                s['open'] = False
+                continue
+            start = cents(max(debit_mid if ok(debit_mid) else 0.01, 0.01))
+            limit = cents(min(max(debit_nat if ok(debit_nat) else WIDTH, start) + 0.05, WIDTH))
+            steps = max(int(round((limit - start) * 100)), 0)
+            filled, px = self.work_order(s['combo'], 'BUY', remaining, start, limit, 0.01,
+                                         EXIT_REPRICE_SEC, min(steps, 20))
+            if filled:
+                s['open'] = filled < remaining
+                log('closed', side=s['side'], short=s['short'], long=s['long'], qty=filled,
+                    credit=round(s['credit'], 2), price=round(px, 2),
+                    pnl_per_contract=round((s['credit'] - px) * 100, 2), note='15:55 flatten')
+            else:
+                log('close_fail', side=s['side'], short=s['short'], long=s['long'],
+                    note='combo did not fill - closing legs individually')
+        self.close_leftover_legs()
+
+    def close_leftover_legs(self):
+        """Safety net: anything still holding a SPY option expiring today (including
+        positions from an earlier run of this script) is closed leg by leg."""
+        if self.dry or not CLOSE_LEFTOVER_LEGS:
+            return
+        for t in self.ib.openTrades():
+            if t.order.orderRef == TAG:
+                self.ib.cancelOrder(t.order)
+        self.ib.sleep(2)
+        legs = [p for p in self.ib.positions()
+                if p.contract.secType == 'OPT' and p.contract.symbol == SYMBOL
+                and p.contract.lastTradeDateOrContractMonth == self.expiry and p.position != 0]
+        # buy back shorts first so we are never left naked short
+        for p in sorted(legs, key=lambda p: p.position):
+            c = p.contract
+            c.exchange = 'SMART'
+            [t] = self.quotes([c], wait=2)
+            self.release([c])
+            action = 'BUY' if p.position < 0 else 'SELL'
+            px = t.ask if action == 'BUY' else t.bid
+            if not ok(px) or px <= 0:
+                px = 0.01 if action == 'SELL' else WIDTH
+            trade = self.ib.placeOrder(c, LimitOrder(action, abs(p.position), cents(px),
+                                                     tif='DAY', orderRef=TAG))
+            self.ib.sleep(5)
+            log('leg_close', short=c.strike, qty=abs(p.position), price=cents(px),
+                note=f'{action} {c.right} - {trade.orderStatus.status}')
+
+
+# ================================== RUN ======================================
+def main():
+    ap = argparse.ArgumentParser(description='0DTE SPY credit spreads on IBKR (variant I rules).')
+    ap.add_argument('--dry-run', action='store_true', help='pick strikes and log, no orders')
+    a = ap.parse_args()
+    if PORT in (7496, 4001) and not ALLOW_LIVE:
+        sys.exit('PORT is a LIVE port. Set ALLOW_LIVE = True if you really mean it.')
+    if now_et().weekday() >= 5:
+        sys.exit('Weekend - market closed.')
+
+    ib = IB()
+    ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=20)
+    ib.reqMarketDataType(MARKET_DATA_TYPE)
+    bot = CreditSpreads(ib, dry_run=a.dry_run)
+    times = list(range(hm(ENTRY_START), bot.last_entry_m + 1, ENTRY_EVERY))
+    print('Entries at ' + ', '.join(f'{t // 60:02d}:{t % 60:02d}' for t in times) + ' ET')
+    done = set()
+    while True:
+        m = minute_now()
+        if not ib.isConnected():
+            print('Disconnected - reconnecting ...')
+            try:
+                ib.connect(HOST, PORT, clientId=CLIENT_ID, timeout=20)
+                ib.reqMarketDataType(MARKET_DATA_TYPE)
+            except Exception as e:
+                print(f'  reconnect failed: {e}')
+                ib.sleep(30)
+                continue
+        for t in times:
+            if t not in done and t <= m < t + 5:
+                done.add(t)
+                bot.entry()
+            elif t not in done and m >= t + 5:
+                done.add(t)              # started late - don't chase missed entries
+        bot.manage()
+        if m >= bot.flatten_m:
+            bot.flatten()
+            break
+        ib.sleep(5)
+    ib.disconnect()
+    print('Done for the day.')
+
+
+if __name__ == '__main__':
+    main()

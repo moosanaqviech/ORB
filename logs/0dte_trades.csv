@@ -1,0 +1,12 @@
+date,time,event,side,short,long,qty,price,credit,pnl_per_contract,spot,short_delta,note
+2026-10-02,11:30:03,skip_day,,,,,,,,,,jobs-report Friday
+2026-10-02,11:36:02,no_price,put,,,,,,,,,no SPY price
+2026-10-02,11:36:02,no_price,call,,,,,,,,,no SPY price
+2026-10-04,14:09:20,no_price,put,,,,,,,,,no SPY price
+2026-10-04,14:09:20,no_price,call,,,,,,,,,no SPY price
+2026-10-12,10:00:11,skip_side,put,771.0,769.0,,,,,778.9,-0.108,mid credit < 0.1
+2026-10-12,10:00:21,skip_side,call,786.0,788.0,,,,,779.1,0.087,mid credit < 0.1
+2026-10-12,10:15:12,skip_side,put,774.0,772.0,,0.06,,,777.82,-0.086,mid credit < 0.1
+2026-10-12,10:15:21,skip_side,call,781.0,783.0,,0.05,,,777.83,0.074,mid credit < 0.1
+2026-10-12,10:45:14,skip_side,put,773.0,771.0,,0.02,,,777.86,-0.044,mid credit < 0.1
+2026-10-12,10:45:24,skip_side,call,780.0,782.0,,0.08,,,777.79,0.117,mid credit < 0.1
